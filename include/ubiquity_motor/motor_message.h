@@ -56,6 +56,8 @@ typedef boost::array<uint8_t, 8> RawMotorMessage;
 #define MIN_FW_OPTION_SWITCH      37
 #define MIN_FW_PID_RDY_REGS       37
 #define MIN_FW_WHEEL_DIRECTION    38
+#define MIN_FW_WHEEL_NULL_ERROR   38
+#define MIN_FW_PID_CONTROL_REV2   39
 
 // It is CRITICAL that the values in the Registers enum remain in sync with Firmware register numbers.
 // In fact once a register is defined and released, it should NOT be re-used at a later time for another purpose
@@ -85,13 +87,13 @@ public:
 
         // skip 0x05 and 0x06
 
-        REG_LEFT_SPEED_SET = 0x07,      // Deprecated
+        REG_BOTH_PWM = 0x07,            // Both wheel PWM drive values in packed 16 bit ints
         REG_RIGHT_SPEED_SET = 0x08,     // Deprecated
 
         REG_LEFT_RAMP = 0x09,           // Deprecated
         REG_RIGHT_RAMP = 0x0A,          // Deprecated
 
-        REG_LEFT_ODOM = 0x0B,           // Deprecated
+        REG_WHEEL_NULL_ERR = 0x0B,      // Specifies a one time null of pid loop position setpoint
         REG_WHEEL_DIR = 0x0C,           // Set wheels to go in reverse if set for OPT_WHEEL_DIR_REVERSE
 
         REG_DEADMAN = 0x0D,             // Deadman timer (VERY TRICKY VALUE, USE WITH CARE!)
@@ -100,7 +102,7 @@ public:
         REG_RIGHT_CURRENT = 0x0F,       // Electrical Current readback for M2 motor
 
         REG_WHEEL_TYPE = 0x10,          // The type of wheel-motor in use
-        REG_5V_MAIN_ERROR = 0x11,       // Deprecated
+        REG_PID_ERROR_CAP = 0x11,       // An error term cap used only if out of wack mode is active [v39]
         REG_OPTION_SWITCH = 0x12,       // Setting of MCB option jumpers and rev
         REG_PWM_OVERRIDE = 0x13,
         REG_PID_CONTROL = 0x14,         // A write to this register controls Pid param setup and calculations
@@ -169,8 +171,18 @@ public:
 
     // PID Control values used in special register PID_CONTROL
     enum PidControlActions {
-        PID_CTRL_RESET               = 1,
-        PID_CTRL_PWM_OVERRIDE        = 2
+        PID_CTRL_NO_SPECIAL_MODES      = 0x000,
+        PID_CTRL_RESET                 = 0x001,    // Write this to this reg to do null of position error
+        PID_CTRL_PWM_OVERRIDE          = 0x002,    // When set we can directly set PWM. Used in testing
+        PID_CTRL_P_ONLY_ON_0_VEL       = 0x004,    // When velocity is zero just use P term for PID 
+        PID_CTRL_USE_ONLY_P_TERM       = 0x008,    // Ignores I and D terms in PID calculations
+        PID_CTRL_SQUARED_ERROR         = 0x010,    // Use an error squared term for enhanced low error turns
+        PID_CTRL_CAP_POS_SETPOINT      = 0x020,    // PID ctrl mode that keeps from letting error be too high
+        PID_CTRL_BOOST_P_TERM          = 0x040,    // Boosts Proportional gain if set
+        PID_CTRL_BOOST_P_TURBO         = 0x080,    // If in boost mode this sets even higher gain boost
+        PID_CTRL_AUTOSHIFT_TO_SQUARED  = 0x100,    // Will shift to P squared mode if rotating
+        PID_CTRL_AUTOSHIFT_TO_BOOST_P  = 0x200,    // Will shift to a higher P factor if rotating
+        PID_CTRL_USE_VELOCITY_TERM     = 0x800     // Allow a PID velocity term. IF it is 0 it has no effect
     };
 
     // Bitfield values for hardware options enabled in the firmware

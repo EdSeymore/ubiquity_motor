@@ -44,6 +44,7 @@ static const double BILLION = 1000000000.0;
 static FirmwareParams g_firmware_params;
 static CommsParams    g_serial_params;
 static NodeParams     g_node_params;
+static int32_t        g_wheel_type_int;
 
 // Until we have a holdoff for MCB message overruns we do this delay to be cautious
 // Twice the period for status reports from MCB
@@ -103,8 +104,9 @@ void initMcbParameters(std::unique_ptr<MotorHardware> &robot )
             g_node_params.wheel_type = "standard";
             wheel_type = MotorMessage::OPT_WHEEL_TYPE_STANDARD;
         }
-        // Write out the wheel type setting to hardware layer
-        robot->setWheelType(wheel_type);
+        // Set global and also Write out the wheel type setting to hardware layer
+        g_wheel_type_int = wheel_type;
+        robot->setWheelType(g_wheel_type_int);
         mcbStatusPeriodSec.sleep();
     }
 
@@ -192,7 +194,7 @@ int main(int argc, char* argv[]) {
         int times = 0;
         while (ros::ok() && robot.get() == nullptr) {
             try {
-                robot.reset(new MotorHardware(nh, g_serial_params, g_firmware_params));
+                robot.reset(new MotorHardware(nh, g_node_params, g_serial_params, g_firmware_params));
             }
             catch (const serial::IOException& e) {
                 if (times % 30 == 0)
@@ -311,6 +313,9 @@ int main(int argc, char* argv[]) {
             robot-> setWheelJointVelocities(leftWheelVel, rightWheelVel); // rad/sec
             leftLastWheelPos  = leftWheelPos;
             rightLastWheelPos = rightWheelPos;
+
+            // Publish motor state at this time
+            robot->publishMotorState();
         }
 
         robot->readInputs();
@@ -335,9 +340,9 @@ int main(int argc, char* argv[]) {
             last_sys_maint_time = ros::Time::now();
 
             // Post a status message for MCB state periodically. This may be nice to do more on as required
-            ROS_INFO("Battery = %5.2f volts, MCB system events 0x%x, Wheel type '%s'",
-                robot->getBatteryVoltage(), robot->system_events, 
-                (robot->wheel_type == MotorMessage::OPT_WHEEL_TYPE_THIN) ? "thin" : "standard");
+            ROS_INFO("Battery = %5.2f V, MCB sys events 0x%x, PidCtrl 0x%x, WheelType '%s'",
+                robot->getBatteryVoltage(), robot->system_events, robot->getPidControlWord(),
+                g_node_params.wheel_type.c_str());
 
             // If we detect a power-on of MCB we should re-initialize MCB
             if ((robot->system_events & MotorMessage::SYS_EVENT_POWERON) != 0) {
@@ -355,7 +360,7 @@ int main(int argc, char* argv[]) {
             // This can be removed when a solid message protocol is developed
             if (robot->firmware_version >= MIN_FW_WHEEL_TYPE_THIN) {
                 // Refresh the wheel type setting
-                robot->setWheelType(robot->wheel_type);
+                robot->setWheelType(g_wheel_type_int);
                 mcbStatusPeriodSec.sleep();
             }
         }

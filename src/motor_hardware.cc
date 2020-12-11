@@ -52,6 +52,8 @@ const static uint8_t  I2C_PCF8574_8BIT_ADDR = 0x40; // I2C addresses are 7 bits 
 #define TICKS_PER_RADIAN_ENC_3_STATE (20.50251516)   // used to read more misleading value of (41.0058030317/2)
 #define QTICKS_PER_RADIAN   (ticks_per_radian*4)      // Quadrature ticks makes code more readable later
 
+#define MOTOR_AMPS_PER_ADC_COUNT   ((double)(0.0238)) // 0.1V/Amp  2.44V=1024 count so 41.97 cnt/amp
+
 #define VELOCITY_READ_PER_SECOND \
     10.0  // read = ticks / (100 ms), so we have scale of 10 for ticks/second
 #define LOWEST_FIRMWARE_VERSION 28
@@ -67,7 +69,7 @@ static int i2c_BufferRead(const char *i2cDevFile, uint8_t i2cAddr,
                           uint8_t* pBuffer, uint16_t NumBytesToRead);
 
 
-MotorHardware::MotorHardware(ros::NodeHandle nh, CommsParams serial_params,
+MotorHardware::MotorHardware(ros::NodeHandle nh, NodeParams node_params, CommsParams serial_params,
                              FirmwareParams firmware_params) {
     ros::V_string joint_names =
         boost::assign::list_of("left_wheel_joint")("right_wheel_joint");
@@ -103,8 +105,12 @@ MotorHardware::MotorHardware(ros::NodeHandle nh, CommsParams serial_params,
     battery_state = nh.advertise<sensor_msgs::BatteryState>("battery_state", 1);
     motor_power_active = nh.advertise<std_msgs::Bool>("motor_power_active", 1);
 
+    motor_state = nh.advertise<ubiquity_motor::MotorState>("motor_state", 1);
+    // FUTURE leftCurrent = nh.advertise<std_msgs::Float32>("left_current", 1);
+    // FUTURE rightCurrent = nh.advertise<std_msgs::Float32>("right_current", 1);
+
     sendPid_count = 0;
-    num_fw_params = 7;     // number of params sent if any change
+    num_fw_params = 0;     // number of params sent if any change
 
     estop_motor_power_off = false;  // Keeps state of ESTOP switch where true is in ESTOP state
 
@@ -118,6 +124,7 @@ MotorHardware::MotorHardware(ros::NodeHandle nh, CommsParams serial_params,
     prev_fw_params.pid_derivative = -1;
     prev_fw_params.pid_velocity = -1;
     prev_fw_params.pid_denominator = -1;
+     prev_fw_params.pid_control = -1;
     prev_fw_params.pid_moving_buffer_size = -1;
     prev_fw_params.max_speed_fwd = -1;
     prev_fw_params.max_speed_rev = -1;
@@ -171,6 +178,25 @@ void MotorHardware::getWheelJointPositions(double &leftWheelPosition, double &ri
 void MotorHardware::setWheelJointVelocities(double leftWheelVelocity, double rightWheelVelocity) {
     joints_[WheelJointLocation::Left].velocity  = leftWheelVelocity;
     joints_[WheelJointLocation::Right].velocity = rightWheelVelocity;
+    return;
+}
+
+// Publish motor state conditions
+void MotorHardware::publishMotorState(void) {
+    ubiquity_motor::MotorState mstateMsg;
+
+    mstateMsg.header.frame_id = "";   // Could be base_link.  We will use empty till required
+    mstateMsg.header.stamp    = ros::Time::now();
+
+    // FUTURE mstateMsg.leftPosition    = joints_[WheelJointLocation::Left].position;
+    // FUTURE mstateMsg.rightPosition   = joints_[WheelJointLocation::Right].position;
+    mstateMsg.leftRotateRate  = joints_[WheelJointLocation::Left].velocity;
+    mstateMsg.rightRotateRate = joints_[WheelJointLocation::Right].velocity;
+    mstateMsg.leftCurrent     = motor_diag_.motorCurrentLeft;
+    mstateMsg.rightCurrent    = motor_diag_.motorCurrentRight;
+    mstateMsg.leftPwmDrive    = motor_diag_.motorPwmDriveLeft;
+    mstateMsg.rightPwmDrive   = motor_diag_.motorPwmDriveRight;
+    motor_state.publish(mstateMsg);
     return;
 }
 
@@ -248,6 +274,30 @@ void MotorHardware::readInputs() {
                     right.data = rightSpeed;
                     leftError.publish(left);
                     rightError.publish(right);
+                    break;
+                }
+
+                case MotorMessage::REG_BOTH_PWM: {
+                    int32_t bothPwm = mm.getData();
+                    motor_diag_.motorPwmDriveLeft  = (bothPwm >> 16) & 0xffff;
+                    motor_diag_.motorPwmDriveRight = bothPwm & 0xffff;
+                    break;
+                }
+
+                case MotorMessage::REG_LEFT_CURRENT: {
+                    // Motor current is an absolute value and goes up from a nominal count of near 1024
+                    // So we subtract a nominal offset then multiply count * scale factor to get amps
+                    int32_t data = mm.getData() & 0xffff;
+                    motor_diag_.motorCurrentLeft =
+                        (double)(data - motor_diag_.motorAmpsZeroAdcCount) * MOTOR_AMPS_PER_ADC_COUNT;
+                    break;
+                }
+                case MotorMessage::REG_RIGHT_CURRENT: {
+                    // Motor current is an absolute value and goes up from a nominal count of near 1024
+                    // So we subtract a nominal offset then multiply count * scale factor to get amps
+                    int32_t data = mm.getData() & 0xffff;
+                    motor_diag_.motorCurrentRight =
+                        (double)(data - motor_diag_.motorAmpsZeroAdcCount) * MOTOR_AMPS_PER_ADC_COUNT;
                     break;
                 }
 
@@ -408,6 +458,24 @@ void MotorHardware::writeSpeeds() {
     writeSpeedsInRadians(left_radians, right_radians);
 }
 
+// areWheelSpeedsZero()  Determine if all wheel joint speeds are below given threshold
+//
+int MotorHardware::areWheelSpeedsLower(double wheelSpeedRadPerSec) {
+    int retCode = 0;
+
+    // This call pulls in speeds from the joints array maintained by other layers
+
+    double  left_radians  = joints_[WheelJointLocation::Left].velocity_command;
+    double  right_radians = joints_[WheelJointLocation::Right].velocity_command;
+
+    if ((std::abs(left_radians)  < wheelSpeedRadPerSec) &&
+        (std::abs(right_radians) < wheelSpeedRadPerSec)) {
+        retCode = 1;
+    }
+
+    return retCode;
+}
+
 void MotorHardware::requestFirmwareVersion() {
     MotorMessage fw_version_msg;
     fw_version_msg.setRegister(MotorMessage::REG_FIRMWARE_VERSION);
@@ -432,6 +500,13 @@ void MotorHardware::requestSystemEvents() {
     sys_event_msg.setType(MotorMessage::TYPE_READ);
     sys_event_msg.setData(0);
     motor_serial_->transmitCommand(sys_event_msg);
+}
+
+// Read the wheel currents in amps
+void MotorHardware::getMotorCurrents(double &currentLeft, double &currentRight) {
+    currentLeft  = motor_diag_.motorCurrentLeft;
+    currentRight = motor_diag_.motorCurrentRight;
+    return;
 }
 
 
@@ -485,13 +560,33 @@ void MotorHardware::setMaxFwdSpeed(int32_t max_speed_fwd) {
 // Setup the Wheel Type. Overrides mode in use on hardware
 // This used to only be standard but THIN_WHEELS were added in Jun 2020
 void MotorHardware::setWheelType(int32_t new_wheel_type) {
-    ROS_INFO_ONCE("setting MCB wheel type %d", (int)wheel_type);
-    wheel_type = new_wheel_type;
+    ROS_INFO_ONCE("setting MCB wheel type %d", (int)new_wheel_type);
     MotorMessage ho;
     ho.setRegister(MotorMessage::REG_WHEEL_TYPE);
     ho.setType(MotorMessage::TYPE_WRITE);
-    ho.setData(wheel_type);
+    ho.setData(new_wheel_type);
     motor_serial_->transmitCommand(ho);
+}
+
+// Setup the PID control options. Overrides modes in use on hardware
+void MotorHardware::setPidControl(int32_t pid_control_word) {
+    ROS_INFO_ONCE("setting MCB pid control word to 0x%x", (int)pid_control_word);
+    MotorMessage mm;
+    mm.setRegister(MotorMessage::REG_PID_CONTROL);
+    mm.setType(MotorMessage::TYPE_WRITE);
+    mm.setData(pid_control_word);
+    motor_serial_->transmitCommand(mm);
+}
+
+// Do a one time NULL of the wheel setpoint based on current position error
+// This allows to relieve stress in static situation where wheels cannot slip to match setpoint
+void MotorHardware::nullWheelErrors(void) {
+    ROS_DEBUG("Nulling MCB wheel errors using current wheel positions");
+    MotorMessage mm;
+    mm.setRegister(MotorMessage::REG_WHEEL_NULL_ERR);
+    mm.setType(MotorMessage::TYPE_WRITE);
+    mm.setData(MotorOrWheelNumber::Motor_M1|MotorOrWheelNumber::Motor_M2);
+    motor_serial_->transmitCommand(mm);
 }
 
 // Setup the Wheel direction. Overrides mode in use on hardware
@@ -503,6 +598,13 @@ void MotorHardware::setWheelDirection(int32_t wheel_direction) {
     ho.setType(MotorMessage::TYPE_WRITE);
     ho.setData(wheel_direction);
     motor_serial_->transmitCommand(ho);
+}
+
+// A simple fetch of the pid_control word from firmware params
+int MotorHardware::getPidControlWord(void) {
+    int pidControlWord;
+    pidControlWord = motor_diag_.fw_pid_control;
+    return pidControlWord;
 }
 
 // Read the controller board option switch itself that resides on the I2C bus but is on the MCB
@@ -593,6 +695,7 @@ void MotorHardware::setParams(FirmwareParams fp) {
     fw_params.pid_denominator = fp.pid_denominator;
     fw_params.pid_moving_buffer_size = fp.pid_moving_buffer_size;
     fw_params.pid_denominator = fp.pid_denominator;
+    fw_params.pid_control = fp.pid_control;
     fw_params.max_pwm = fp.max_pwm;
     fw_params.estop_pid_threshold = fp.estop_pid_threshold;
 }
@@ -706,6 +809,18 @@ void MotorHardware::sendParams() {
         maxpwm.setType(MotorMessage::TYPE_WRITE);
         maxpwm.setData(fw_params.max_pwm);
         commands.push_back(maxpwm);
+    }
+
+    if (cycle == 7 &&
+        fw_params.pid_control != prev_fw_params.pid_control) {
+        ROS_WARN("Setting PidParam pid_control to %d", fw_params.pid_control);
+        prev_fw_params.pid_control = fw_params.pid_control;
+        motor_diag_.fw_pid_control = fw_params.pid_control;
+        MotorMessage mmsg;
+        mmsg.setRegister(MotorMessage::REG_PID_CONTROL);
+        mmsg.setType(MotorMessage::TYPE_WRITE);
+        mmsg.setData(fw_params.pid_control);
+        commands.push_back(mmsg);
     }
 
     // SUPPORT NOTE!  Adjust max modulo for total parameters in the cycle, be sure no duplicates used!
